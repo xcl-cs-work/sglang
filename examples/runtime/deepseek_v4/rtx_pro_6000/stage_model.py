@@ -90,12 +90,12 @@ def stage(source, destination, headroom_gib, disk_dirs=()):
     if int(available.split()[1]) * 1024 < ram_bytes + (headroom_gib << 30):
         raise MemoryError("Insufficient available host RAM for checkpoint and headroom")
 
-    # Refuse to reuse an existing directory, including stale links from another PID.
-    destination.mkdir(mode=0o700)
     with ExitStack() as cleanup:
         stopped = threading.Event()
         previous_handler = signal.signal(signal.SIGTERM, lambda *_: stopped.set())
         cleanup.callback(signal.signal, signal.SIGTERM, previous_handler)
+        # Refuse to reuse a directory, including stale links from another PID.
+        destination.mkdir(mode=0o700)
         cleanup.callback(shutil.rmtree, destination)
         local_dirs = [
             Path(
@@ -169,10 +169,10 @@ if __name__ == "__main__":
     disk_dirs = []
     for root, gib in args.disk_dir:
         try:
-            budget = float(gib)
+            budget = float(gib) * 2**30
         except ValueError:
             parser.error("--disk-dir GIB must be a positive finite number")
         if not math.isfinite(budget) or budget <= 0:
             parser.error("--disk-dir GIB must be a positive finite number")
-        disk_dirs.append((Path(root).resolve(), int(budget * 2**30)))
+        disk_dirs.append((Path(root).resolve(), int(budget)))
     stage(args.source, args.destination, args.headroom_gib, disk_dirs)
