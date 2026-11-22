@@ -1434,6 +1434,13 @@ def get_lora_layer(
             experts_shared_outer_loras=experts_shared_outer_loras,
             max_lora_rank=max_lora_rank,
         )
+    # Inkling 2 QKVR runs on stacked Q/K/V sources.
+    if getattr(layer, "is_inkling2_qkvr", False):
+        from sglang.srt.models.inkling_common.inkling2_lora import (
+            Inkling2QKVRLinearWithLoRA,
+        )
+
+        return Inkling2QKVRLinearWithLoRA(layer, lora_backend)
     # Inkling QKVR needs custom LoRA-B slicing despite being a merged linear.
     if getattr(layer, "is_inkling_qkvr", False):
         return InklingQKVRLinearWithLoRA(layer, lora_backend)

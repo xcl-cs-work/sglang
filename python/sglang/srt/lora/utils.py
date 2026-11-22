@@ -334,6 +334,13 @@ def get_normalized_target_modules(
         "lm_head": "lm_head",
         "output": "lm_head",
         "unembed_tokens": "lm_head",
+        # Inkling: the split attention projections serve as one qkvr; Inkling 2 names its head unembed
+        "wq_du": "qkvr",
+        "wk_dv": "qkvr",
+        "wv_dv": "qkvr",
+        "wr_du": "qkvr",
+        "gate_attn": "qkvr",
+        "unembed": "lm_head",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
         # DSA indexer projections are qualified with their parent module name

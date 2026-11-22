@@ -246,14 +246,28 @@ class Inkling2LogitsProcessor(LogitsProcessor):
     def _compute_lm_head(
         self, hidden_states, lm_head, embedding_bias=None, *, out=None
     ):
-        logits = super()._compute_lm_head(
-            hidden_states, lm_head, embedding_bias, out=out
-        )
+        if hasattr(lm_head, "base_layer") and hasattr(lm_head, "apply_lora"):
+            logits = self._compute_lm_head_with_lora(
+                hidden_states, lm_head, embedding_bias, out
+            )
+        else:
+            logits = super()._compute_lm_head(
+                hidden_states, lm_head, embedding_bias, out=out
+            )
         if self.shard_softcap:
             if logits.is_cuda:
                 fused_softcap(logits, self.shard_softcap)
             else:
                 logits = self.shard_softcap * torch.tanh(logits / self.shard_softcap)
+        return logits
+
+    def _compute_lm_head_with_lora(self, hidden_states, lm_head, embedding_bias, out):
+        """The fp32 base head on the wrapped layer, then the LoRA delta added in place (pre-softcap)."""
+        logits = super()._compute_lm_head(
+            hidden_states, lm_head.base_layer, embedding_bias, out=out
+        )
+        if lm_head.lora_active:
+            logits = lm_head.apply_lora(logits, hidden_states)
         return logits
 
     def _get_logits(
@@ -422,9 +436,53 @@ class Inkling2CausalLLM(nn.Module):
         return state
 
 
+QKVR_PROJECTIONS = (
+    "wq_du",
+    "wk_dv",
+    "wv_dv",
+    "wr_du",
+    "gate_attn",
+    "attn_sink_proj",
+)
+# LoRA adapts the leading qkvr slices; the attention sink takes no adapter
+LORA_QKVR_PROJECTIONS = QKVR_PROJECTIONS[:5]
+
+
 class Inkling2ForConditionalGeneration(nn.Module):
     fall_back_to_pt_during_load = False
     allow_patterns_overrides = ["model*.safetensors"]
+    supported_lora_modules = ["qkvr", "wo_ud", "gate_up_proj", "down_proj", "lm_head"]
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        # the decoder only: the vision tower and the attention residual queries stay frozen
+        return module_name.startswith("llm.layers.")
+
+    def get_stacked_multiply(self, module_name: str) -> int:
+        if module_name == "qkvr":
+            return len(LORA_QKVR_PROJECTIONS)
+        if module_name in ("gate_up_proj", "gate_up_proj_moe"):
+            return 2
+        return 1
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> tuple[int, int]:
+        config = self.text_config
+        hidden, inter = config.hidden_size, config.intermediate_size
+        attn = self.llm.layers[layer_idx].attn
+        if module_name == "qkvr":
+            qkvr = getattr(attn.qkvr, "base_layer", attn.qkvr)
+            return qkvr.input_size, sum(qkvr.output_sizes[: len(LORA_QKVR_PROJECTIONS)])
+        if module_name == "wo_ud":
+            wo_ud = getattr(attn.wo_ud, "base_layer", attn.wo_ud)
+            return wo_ud.input_size, wo_ud.output_size
+        if module_name in ("gate_up_proj", "gate_up_proj_moe"):
+            return hidden, 2 * inter
+        if module_name in ("down_proj", "down_proj_moe"):
+            return inter, hidden
+        if module_name == "lm_head":
+            return hidden, config.padded_vocab_size
+        if module_name == "embed_tokens":
+            return config.padded_vocab_size, hidden
+        raise NotImplementedError(f"Inkling2 has no LoRA module {module_name}")
 
     def __init__(self, config: Inkling2MMConfig, quant_config=None, prefix: str = ""):
         super().__init__()
@@ -589,14 +647,7 @@ class Inkling2ForConditionalGeneration(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
         loaded = set()
-        projections = (
-            "wq_du",
-            "wk_dv",
-            "wv_dv",
-            "wr_du",
-            "gate_attn",
-            "attn_sink_proj",
-        )
+        projections = QKVR_PROJECTIONS
         packed_shards: dict[str, set[int]] = {}
         for checkpoint_name, weight in weights:
             name = checkpoint_name.removeprefix("model.")

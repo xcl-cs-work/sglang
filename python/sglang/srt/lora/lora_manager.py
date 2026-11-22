@@ -620,6 +620,7 @@ class LoRAManager:
                 if (
                     isinstance(module, FusedMoEWithLoRA)
                     or getattr(module, "is_shared_fused_moe", False)
+                    or getattr(module, "is_inkling2_lora_experts", False)
                 ) and all(
                     x in self.target_modules for x in ["gate_up_proj", "down_proj"]
                 ):
@@ -1162,6 +1163,15 @@ class LoRAManager:
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )
+                continue
+
+            if getattr(module, "is_inkling2_lora_experts", False) and all(
+                x in self.target_modules for x in ["gate_up_proj", "down_proj"]
+            ):
+                layer_id = get_layer_id(module_name)
+                if layer_id is not None:
+                    module.initialize_lora(self.lora_backend)
+                    self.lora_modules[layer_id][module_name] = module
                 continue
 
             if isinstance(module, (FusedMoE, InklingBatchDenseMLP)) and all(
