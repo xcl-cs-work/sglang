@@ -156,6 +156,8 @@ class Inkling2Attention(nn.Module):
         )
         if self.qkvr.bias is not None:
             self.qkvr.bias.data.zero_()
+        # LoRA wraps qkvr in Inkling2QKVRLinearWithLoRA (stacked Q/K/V sources)
+        self.qkvr.is_inkling2_qkvr = True
         self.wo_ud = RowParallelLinear(
             self.head_dim * self.num_total_heads,
             config.hidden_size,
@@ -422,9 +424,15 @@ class Inkling2Attention(nn.Module):
 
     def _project_sources(self, sources):
         if len({id(sources.q), id(sources.k), id(sources.v)}) == 3:
+            # a LoRA-wrapped qkvr applies its delta per source chunk
+            lora = (
+                {"lora_num_sources": 3}
+                if getattr(self.qkvr, "is_inkling2_qkvr_lora", False)
+                else {}
+            )
             q_proj, k_proj, v_proj = (
                 projected.split(self.split_sizes, dim=-1)[:6]
-                for projected in self.qkvr(_stacked(sources))[0].chunk(3)
+                for projected in self.qkvr(_stacked(sources), **lora)[0].chunk(3)
             )
             q, _, _, r, gate, sinks = q_proj
             return q, k_proj[1], v_proj[2], r, gate, sinks
@@ -615,7 +623,8 @@ class Inkling2Attention(nn.Module):
             oneshot_all_reduce_input(
                 parallel.attn_tp_group, tokens, self.hidden_size, output.dtype
             )
-            if multicast
+            # a LoRA-wrapped wo_ud takes no output_tensor
+            if multicast and not hasattr(self.wo_ud, "base_layer")
             else None
         )
         if buffer is not None:

@@ -181,6 +181,9 @@ class LoRAAdapter(nn.Module):
         # recognized and loaded into the correct buffer.
         if "unembed_tokens" in name:
             name = name.replace("unembed_tokens", "lm_head")
+        # Inkling 2 exports its head as model.llm.unembed
+        if ".unembed." in name:
+            name = name.replace(".unembed.", ".lm_head.")
 
         layer_id = get_layer_id(name)
         if layer_id is not None:
@@ -237,29 +240,20 @@ class LoRAAdapter(nn.Module):
             if "wq_du" not in weight_name:
                 continue
 
-            q_name = weight_name
-            k_name = weight_name.replace("wq_du", "wk_dv")
-            v_name = weight_name.replace("wq_du", "wv_dv")
-            r_name = weight_name.replace("wq_du", "wr_du")
+            # Inkling 2 adds the output gate (gate_attn) as a fifth adapted slice
+            leaves = ["wq_du", "wk_dv", "wv_dv", "wr_du"]
+            if weight_name.replace("wq_du", "gate_attn") in weights:
+                leaves.append("gate_attn")
+            names = [weight_name.replace("wq_du", leaf) for leaf in leaves]
             qkvr_name = weight_name.replace("wq_du", "qkvr")
 
-            if any(name not in weights for name in (k_name, v_name, r_name)):
+            if any(name not in weights for name in names):
                 continue
 
-            cat_dim = weights[q_name].dim() - 2
-            weights[qkvr_name] = torch.cat(
-                (
-                    weights[q_name],
-                    weights[k_name],
-                    weights[v_name],
-                    weights[r_name],
-                ),
-                cat_dim,
-            )
-            weights.pop(q_name)
-            weights.pop(k_name)
-            weights.pop(v_name)
-            weights.pop(r_name)
+            cat_dim = weights[names[0]].dim() - 2
+            weights[qkvr_name] = torch.cat([weights[name] for name in names], cat_dim)
+            for name in names:
+                weights.pop(name)
 
         for weight_name in list(weights.keys()):
             if "qkvr" not in weight_name or "lora_A" not in weight_name:
@@ -267,7 +261,12 @@ class LoRAAdapter(nn.Module):
             if weights[weight_name].shape[-2] != self.config.r:
                 continue
             repeat_dims = [1] * weights[weight_name].dim()
-            repeat_dims[-2] = 4
+            stacked = 4
+            if self.base_model is not None and hasattr(
+                self.base_model, "get_stacked_multiply"
+            ):
+                stacked = self.base_model.get_stacked_multiply("qkvr")
+            repeat_dims[-2] = stacked
             weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
 
     def normalize_qkv_proj(

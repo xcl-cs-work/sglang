@@ -373,7 +373,10 @@ class LoRAMemoryPool:
         # commit to allocating 4D per-expert LoRA buffers.
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        return any(isinstance(m, FusedMoE) for m in base_model.modules())
+        return any(
+            isinstance(m, FusedMoE) or getattr(m, "is_inkling2_lora_experts", False)
+            for m in base_model.modules()
+        )
 
     def _get_num_local_experts(self, base_model: torch.nn.Module) -> int:
         """Resident factor count; new MoE LoRA providers use EP-local factors."""
@@ -1090,8 +1093,10 @@ class LoRAMemoryPool:
             from sglang.srt.lora.layers import FusedMoEWithLoRA
 
             for module_name, module in cur_layer_modules.items():
-                if isinstance(module, FusedMoEWithLoRA) or getattr(
-                    module, "is_shared_fused_moe", False
+                if (
+                    isinstance(module, FusedMoEWithLoRA)
+                    or getattr(module, "is_shared_fused_moe", False)
+                    or getattr(module, "is_inkling2_lora_experts", False)
                 ):
                     base_layer = getattr(module, "base_layer", module)
                     key_suffix = (
