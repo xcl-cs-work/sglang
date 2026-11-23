@@ -42,17 +42,28 @@ class Inkling2QKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
 
 def _token_slots(batch_info, tokens: int, device) -> torch.Tensor:
     """Adapter slot of each token in the forward's own order (-1: none), from the dense LoRA batch info,
-    without a host sync (CUDA-graph safe)."""
-    segments = batch_info.seg_indptr[1 : batch_info.num_segments + 1]
-    rows = torch.arange(tokens, device=device, dtype=segments.dtype)
-    segment = torch.searchsorted(segments, rows, right=True).clamp_(
-        max=batch_info.num_segments - 1
+    without a host sync (CUDA-graph safe). Rows past the batch's real tokens (graph padding) get -1."""
+    # num_segments is a host int that a captured graph would freeze; under CUDA graphs read the full
+    # fixed-size buffers instead, whose unused tail segments are empty (indptr filled with the total)
+    num = (
+        batch_info.weight_indices.shape[0]
+        if batch_info.use_cuda_graph
+        else batch_info.num_segments
     )
-    slots = batch_info.weight_indices[segment].long()
+    indptr = batch_info.seg_indptr[: num + 1]
+    rows = torch.arange(tokens, device=device, dtype=indptr.dtype)
+    segment = torch.searchsorted(indptr[1:], rows, right=True).clamp_(max=num - 1)
+    real = rows < indptr[num]
+    slots = torch.where(real, batch_info.weight_indices[segment].long(), -1)
     if batch_info.permutation is not None:
-        slots = torch.empty_like(slots).scatter_(
-            0, batch_info.permutation[:tokens].long(), slots
-        )
+        # sorted row i is token permutation[i]; stale tail entries scatter into a dummy row
+        perm = batch_info.permutation[:tokens].long()
+        index = torch.full((tokens,), tokens, device=device, dtype=torch.long)
+        index[: perm.numel()] = perm
+        index = torch.where(real, index, tokens)
+        slots = torch.full(
+            (tokens + 1,), -1, device=device, dtype=torch.long
+        ).scatter_(0, index, slots)[:tokens]
     ranks = batch_info.lora_ranks[slots.clamp(min=0)]
     return torch.where((slots >= 0) & (ranks > 0), slots, -1)
 
@@ -144,7 +155,9 @@ class _ExpertLoRAForward:
             s = self.s[token].view(-1, 2, r)
             delta = torch.einsum("mfcr,mcr->mfc", b, s).flatten(1)
             if scale is not None:
-                delta = delta / scale[rows, None]
+                # a zero-amax row (all-zero input) has a zero delta; keep it zero, not 0/0
+                row_scale = scale[rows, None]
+                delta = torch.where(row_scale > 0, delta / row_scale, 0.0)
             # rows of other ranks' experts are left as they are (their scale may be unset)
             delta = torch.where(local[:, None], delta, 0.0)
             out[rows] = (out[rows].float() + delta).to(out.dtype)

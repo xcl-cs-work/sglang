@@ -307,9 +307,22 @@ class Inkling2Experts(nn.Module):
     def initialize_lora(self, lora_backend):
         from sglang.srt.models.inkling_common.inkling2_lora import Inkling2ExpertsLoRA
 
+        # fail at startup on the paths forward() has no LoRA side path for
         if self.mega is not None:
             raise NotImplementedError(
                 "Inkling 2 expert LoRA does not run under MegaMoE"
+            )
+        quantized = self.w13_weight.dtype in (torch.uint8, torch.float8_e4m3fn)
+        marlin = self.use_marlin and quantized
+        if quantized and not self.native_sm120 and not marlin:
+            raise NotImplementedError(
+                "Inkling 2 expert LoRA covers BF16 experts, the SM120 native NVFP4 / "
+                "MXFP8 path and Marlin; not the SM100 routed kernels"
+            )
+        if marlin and self.multicast_combine:
+            raise NotImplementedError(
+                "Inkling 2 expert LoRA does not run on Marlin with the multicast "
+                "combine (SM90)"
             )
         self.lora = Inkling2ExpertsLoRA(self, lora_backend)
 
@@ -658,14 +671,12 @@ class Inkling2Experts(nn.Module):
         if lora is not None:
             if self.native_sm120:
                 return self._forward_sm120(x, weights, ids, combine, lora=lora)
-            if self._marlin and not self.multicast_combine:
+            if self._marlin:
                 return self._forward_source(x, weights, ids, combine, lora=lora)
-            if self._routed_kernels is None and not self._marlin:
-                return self._forward_bf16_sorted(x, weights, ids, lora)
-            raise NotImplementedError(
-                "Inkling 2 expert LoRA prototype covers the BF16 sorted path, the SM120 "
-                "native NVFP4 / MXFP8 path and SM120 Marlin; not the SM100 routed kernels"
-            )
+            # BF16 experts only; initialize_lora rejected every quantized path without a
+            # LoRA side path
+            assert self._routed_kernels is None and not self._lacks_routed_kernels
+            return self._forward_bf16_sorted(x, weights, ids, lora)
         if self.native_sm120:
             return self._forward_sm120(x, weights, ids, combine)
         if self._marlin:
