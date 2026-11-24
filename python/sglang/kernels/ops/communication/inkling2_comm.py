@@ -11,6 +11,10 @@ from sglang.kernels.jit.utils import (
 )
 from sglang.kernels.ops.communication import inkling_all_reduce as ar
 
+PDL = is_arch_support_pdl()
+# griddepcontrol needs SM90+; read inside kernels as a constexpr.
+PDL_ARCH = tl.constexpr(PDL)
+
 _RANK_ORDER_MAX_BYTES = {2: 1200 * 1024, 4: 512 * 1024, 8: 288 * 1024, 16: 64 * 1024}
 
 
@@ -313,8 +317,9 @@ def prepare_routed_exchange(group, max_rows, hidden):
 
 @triton.jit
 def _peer_barrier(FlagPtrs, State, rank, WORLD: tl.constexpr):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if PDL_ARCH:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     epoch = tl.load(State) + 1
     tl.store(State, epoch)
     for peer in tl.static_range(WORLD):
@@ -356,8 +361,9 @@ def _prefill_exchange_combine(
     BLOCK: tl.constexpr,
     THREADS: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if PDL_ARCH:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     item = tl.program_id(0)
     src = rank * per_rank + item // CHUNKS
     if src >= tokens:
@@ -411,7 +417,7 @@ class PrefillExchange:
             self.rank,
             self.world,
             num_warps=1,
-            launch_pdl=True,
+            launch_pdl=PDL,
         )
 
     def per_rank(self, tokens):
@@ -436,7 +442,7 @@ class PrefillExchange:
             512,
             128,
             num_warps=4,
-            launch_pdl=True,
+            launch_pdl=PDL,
         )
         self.barrier()
         return self.out[: tokens * self.hidden].view(tokens, self.hidden)

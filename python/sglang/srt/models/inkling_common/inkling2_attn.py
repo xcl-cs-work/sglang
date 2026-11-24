@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.inkling2_attn import (
     pad_head_groups,
 )
 from sglang.kernels.ops.attention.inkling2_attn_prologue import attention_prologue
+from sglang.kernels.ops.attention.score_mod import relative_bias_score_mod
 from sglang.kernels.ops.communication.inkling2_comm import (
     all_reduce,
     oneshot_all_reduce,
@@ -458,10 +459,15 @@ class Inkling2Attention(nn.Module):
             )
 
     def _forward(self, hidden_states, positions, forward_batch, *, attn, attn_padded):
-        assert serving_attention_backend(forward_batch) == "fa4", (
-            "Inkling2 requires FA4 attention"
+        backend = serving_attention_backend(forward_batch)
+        assert backend in ("fa4", "triton"), (
+            "Inkling2 requires FA4 or Triton attention"
         )
+        # Triton (SM8x, which FA4 does not build for) takes the unfused prologue and
+        # applies the relative bias as a score_mod.
+        fa4 = backend == "fa4"
         mxfp8 = get_model().kv_cache_dtype == "mxfp8"
+        assert fa4 or not mxfp8, "Inkling2 MXFP8 KV cache requires FA4"
         fa4_mxfp8 = mxfp8 and not get_platform().is_sm120
         sources = (
             AttentionSources(hidden_states, hidden_states, hidden_states)
@@ -473,7 +479,8 @@ class Inkling2Attention(nn.Module):
         mode = forward_batch.forward_mode
         verify = mode.is_target_verify()
         compact = (
-            not fa4_mxfp8
+            fa4
+            and not fa4_mxfp8
             and self.fused_decode_prologue
             and (
                 mode.is_decode()
@@ -487,7 +494,8 @@ class Inkling2Attention(nn.Module):
             )
         )
         padded = (
-            attn_padded is not None
+            fa4
+            and attn_padded is not None
             and not compact
             and (get_platform().is_sm90 or tokens >= PADDED_DECODE_MIN_TOKENS)
             and (mode.is_decode() or verify)
@@ -546,8 +554,12 @@ class Inkling2Attention(nn.Module):
                 aux_tensors=[rel_bias],
                 q_descale=quantized_q.scale.view(torch.float8_e8m0fnu),
             )
-        else:
+        elif fa4:
             attention_kwargs = dict(rel_bias=rel_bias, **bias_kwargs)
+        else:
+            attention_kwargs = dict(
+                score_mod=relative_bias_score_mod, aux_tensors=[rel_bias]
+            )
         if compact:
             output = attn(
                 q,

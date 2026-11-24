@@ -242,6 +242,9 @@ def _gemv_module(nvfp4, n, k, splits, warps):
 
 def uses_gemv(marlin, tokens, num_local):
     """Whether gemv() beats gemm() for this many tokens (rows per expert <= tokens)."""
+    # The GEMV sums K splits over thread block clusters (SM90+).
+    if torch.cuda.get_device_capability(marlin[0].device)[0] < 9:
+        return False
     nvfp4 = marlin[2] is not None
     return num_local <= GEMV_MAX_EXPERTS and tokens <= (8 if nvfp4 else 2)
 

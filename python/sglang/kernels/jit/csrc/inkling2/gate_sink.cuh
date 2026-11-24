@@ -42,8 +42,8 @@ __global__ void __launch_bounds__(H* D / kVec) gate_sink_kernel(
   // The gate (qkvr projection) and sinks are written several kernels earlier.
   Bits const g = *reinterpret_cast<Bits const*>(gate + row * sg + col);
   float const s = __bfloat162float(sink[row * ss + head]);
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   float const* xr = x + row * sx + source_head * D + col % D;
   float const scale = sigmoid(__fsub_rn(lse[row * sl0 + source_head * sl1], s));
   __nv_bfloat16 const* gh = reinterpret_cast<__nv_bfloat16 const*>(&g);
@@ -63,7 +63,7 @@ void run(
     tvm::ffi::TensorView y) {
   static_assert(D % kVec == 0 && H * D / kVec <= 1024);
   host::LaunchKernel(y.size(0), H * D / kVec, y.device())
-      .enable_pdl(true)(
+      .enable_pdl(SGL_ARCH_HOPPER_OR_GREATER)(
           gate_sink_kernel<H, D, GROUP, PADDED_GROUP>,
           static_cast<float const*>(x.data_ptr()),
           static_cast<__nv_bfloat16 const*>(gate.data_ptr()),

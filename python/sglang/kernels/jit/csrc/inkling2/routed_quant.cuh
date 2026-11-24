@@ -204,8 +204,8 @@ __global__ void __launch_bounds__(split_threads(K)) quantize_routed(
   static_assert(K % 64 == 0 && kSplit > 1);
   __shared__ int s_offsets[kMaxExperts + 1];
   __shared__ float red[2][kThreads / 32];
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   load_offsets(offsets, experts, s_offsets);
   int const block = threadIdx.x / kSplit, part = threadIdx.x % kSplit;
   bool const active = block < K / 16;
@@ -284,8 +284,8 @@ __global__ void __launch_bounds__(split_threads(N)) swiglu_quantize_routed(
   static_assert(N % 64 == 0 && kSplit > 1);
   __shared__ int s_offsets[kMaxExperts + 1];
   __shared__ float red[2][kThreads / 32];
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   load_offsets(offsets, experts, s_offsets);
   int const block = threadIdx.x / kSplit, part = threadIdx.x % kSplit;
   bool const active = block < N / 16;
@@ -364,8 +364,8 @@ __global__ void __launch_bounds__(threads(N)) mxfp8_swiglu_quantize_routed(
     float gate_cap,
     float up_cap) {
   static_assert(N % 32 == 0 && N / 16 <= 1024);
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   int const block = threadIdx.x;
   bool const active = block < N / 16;
   int const lo = offsets[0], hi = offsets[experts];
@@ -402,8 +402,8 @@ constexpr int kRowParts = 3;
 template <int N>
 __global__ void __launch_bounds__(N / 16 / kRowParts)
     mxfp8_quantize_rows(__nv_bfloat16 const* __restrict__ x, uint8_t* values, uint8_t* exponents, int rows) {
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   int const block = (blockIdx.x % kRowParts) * blockDim.x + threadIdx.x;
   for (int row = blockIdx.x / kRowParts; row < rows; row += gridDim.x / kRowParts) {
     float v[16];
@@ -439,7 +439,7 @@ void quantize(
   int experts = offsets.size(0) - 1;
   RuntimeCheck(x.size(1) == K && experts <= kMaxExperts, "Unsupported routed NVFP4 quantize shape");
   host::LaunchKernel(grid_size(dst2src.size(0), sm_count), split_threads(K), x.device())
-      .enable_pdl(true)(
+      .enable_pdl(SGL_ARCH_HOPPER_OR_GREATER)(
           quantize_routed<K>,
           static_cast<__nv_bfloat16 const*>(x.data_ptr()),
           static_cast<int const*>(dst2src.data_ptr()),
@@ -469,7 +469,7 @@ void swiglu_quantize(
   int experts = offsets.size(0) - 1;
   RuntimeCheck(acc.size(1) == 2 * N && experts <= kMaxExperts, "Unsupported routed NVFP4 swiglu quantize shape");
   host::LaunchKernel(grid_size(acc.size(0), sm_count), split_threads(N), acc.device())
-      .enable_pdl(true)(
+      .enable_pdl(SGL_ARCH_HOPPER_OR_GREATER)(
           swiglu_quantize_routed<N>,
           static_cast<float const*>(acc.data_ptr()),
           static_cast<float const*>(acc_amax.data_ptr()),
@@ -497,7 +497,7 @@ void mxfp8_swiglu_quantize(
     int64_t sm_count) {
   host::RuntimeCheck(x.size(1) == 2 * N, "Unsupported MXFP8 swiglu shape");
   host::LaunchKernel(grid_size(x.size(0), sm_count), threads(N), x.device())
-      .enable_pdl(true)(
+      .enable_pdl(SGL_ARCH_HOPPER_OR_GREATER)(
           mxfp8_swiglu_quantize_routed<N>,
           static_cast<__nv_bfloat16 const*>(x.data_ptr()),
           static_cast<float const*>(gammas.data_ptr()),
@@ -516,7 +516,7 @@ void mxfp8_quantize(
     int const rows = x.numel() / N;
     host::RuntimeCheck(x.size(-1) == N, "Unsupported MXFP8 quantize shape");
     host::LaunchKernel(grid_size(rows, sm_count) * kRowParts, N / 16 / kRowParts, x.device())
-        .enable_pdl(true)(
+        .enable_pdl(SGL_ARCH_HOPPER_OR_GREATER)(
             mxfp8_quantize_rows<N>,
             static_cast<__nv_bfloat16 const*>(x.data_ptr()),
             static_cast<uint8_t*>(values.data_ptr()),

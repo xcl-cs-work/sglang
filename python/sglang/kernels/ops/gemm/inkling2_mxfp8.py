@@ -11,6 +11,8 @@ from sglang.kernels.ops.moe.inkling2_moe import (
 )
 
 PDL = is_arch_support_pdl()
+# griddepcontrol needs SM90+; read inside kernels as a constexpr.
+PDL_ARCH = tl.constexpr(PDL)
 
 
 @triton.jit
@@ -31,8 +33,9 @@ def _routed_swap_ab_matmul(
     BK: tl.constexpr,
     TOP_K: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if PDL_ARCH:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     entry = tl.load(Schedule + tl.program_id(0))
     if entry == -1:
         return

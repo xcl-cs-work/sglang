@@ -793,6 +793,22 @@ def _compile_attn_res(width, queries, sources, dtype, normalize_values, has_adde
     )
 
 
+def _attn_res_reference(blocks, partial_addend, queries, *, normalize_values):
+    """Depth-wise softmax over the RMS-normalized sources; the last source gets
+    partial_addend. One FP32 [tokens, width] output per query."""
+    values = torch.stack([block.float() for block in blocks])
+    if partial_addend is not None:
+        values[-1] += partial_addend.float()
+    inv_rms = torch.rsqrt(values.square().mean(-1) + 1e-6)
+    logits = torch.einsum("ntd,qd->qtn", values, queries) * inv_rms.T
+    probabilities = torch.softmax(logits, dim=-1)
+    if normalize_values:
+        values *= inv_rms[..., None]
+    # Rows of one contiguous [queries, tokens, width] tensor, like the CuTe output.
+    output = torch.einsum("qtn,ntd->qtd", probabilities, values).contiguous()
+    return tuple(output.unbind(0))
+
+
 def attn_res(blocks, partial_addend, queries, *, normalize_values=False):
     base = blocks[0]
     assert base.is_cuda and base.is_contiguous() and base.ndim == 2
@@ -808,6 +824,11 @@ def attn_res(blocks, partial_addend, queries, *, normalize_values=False):
     tokens, width = base.shape
     n_queries = queries.shape[0]
     assert queries.shape[1] == width and queries.device == base.device
+    if torch.cuda.get_device_capability(base.device)[0] < 9:
+        # The CuTe kernel stages sources with TMA bulk copies (SM90+).
+        return _attn_res_reference(
+            blocks, partial_addend, queries, normalize_values=normalize_values
+        )
     sources = len(blocks)
     output = torch.empty(
         (n_queries, tokens, width), dtype=torch.float32, device=base.device

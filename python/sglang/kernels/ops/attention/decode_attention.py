@@ -988,11 +988,14 @@ def _fwd_kernel_stage2(
     kv_indptr,
     num_kv_splits,
     sink_ptr,
+    Final_Lse,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
     stride_obs,
     stride_oh,
+    stride_lse_b,
+    stride_lse_h,
     MAX_KV_SPLITS: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -1001,6 +1004,7 @@ def _fwd_kernel_stage2(
     USE_PDL: tl.constexpr = False,
     FORCED_KV_SPLITS: tl.constexpr = 0,
     DYNAMIC_SPLIT_END: tl.constexpr = False,
+    STORE_LSE: tl.constexpr = False,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -1067,6 +1071,13 @@ def _fwd_kernel_stage2(
         cur_sink = tl.load(sink_ptr + cur_head)
         e_sum += tl.exp(cur_sink - e_max)
 
+    if STORE_LSE:
+        # Natural-log softmax normalizer, like the extend kernel's LSE_Extend.
+        tl.store(
+            Final_Lse + cur_batch * stride_lse_b + cur_head * stride_lse_h,
+            e_max + tl.log(e_sum),
+        )
+
     tl.store(
         O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
         acc / e_sum * v_scale,
@@ -1088,6 +1099,7 @@ def _decode_softmax_reducev_fwd(
     use_pdl=False,
     forced_kv_splits: int = 0,
     stop_at_request_splits: bool = False,
+    lse_out=None,
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
@@ -1111,11 +1123,13 @@ def _decode_softmax_reducev_fwd(
         kv_indptr,
         num_kv_splits,
         sinks,
+        lse_out,
         logits.stride(0),
         logits.stride(1),
         logits.stride(2),
         o.stride(0),
         o.stride(1),
+        *(lse_out.stride() if lse_out is not None else (0, 0)),
         MAX_KV_SPLITS=MAX_KV_SPLITS,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         BLOCK_DV=BLOCK_DV,
@@ -1124,6 +1138,7 @@ def _decode_softmax_reducev_fwd(
         USE_PDL=use_pdl,
         FORCED_KV_SPLITS=forced_kv_splits,
         DYNAMIC_SPLIT_END=stop_at_request_splits and not forced_kv_splits,
+        STORE_LSE=lse_out is not None,
         num_warps=4,
         num_stages=2,
         **({"launch_pdl": True} if use_pdl else {}),
@@ -1152,6 +1167,7 @@ def decode_attention_fwd_normal(
     aux_tensors=None,
     uneven_batch=None,
     stop_at_request_splits: bool = False,
+    lse_out=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -1183,6 +1199,7 @@ def decode_attention_fwd_normal(
         max_kv_splits,
         sinks,
         stop_at_request_splits=stop_at_request_splits,
+        lse_out=lse_out,
     )
 
 
@@ -1209,6 +1226,7 @@ def decode_attention_fwd_grouped(
     aux_tensors=None,
     uneven_batch=None,
     stop_at_request_splits: bool = False,
+    lse_out=None,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1247,6 +1265,7 @@ def decode_attention_fwd_grouped(
         use_pdl=use_pdl,
         forced_kv_splits=forced_kv_splits,
         stop_at_request_splits=stop_at_request_splits,
+        lse_out=lse_out,
     )
 
 
@@ -1279,11 +1298,14 @@ def decode_attention_fwd(
     lean_locks=None,
     uneven_batch=None,
     stop_at_request_splits: bool = False,
+    lse_out=None,
 ):
     """``stop_at_request_splits``: the merge walks each request's own split count
     instead of the whole budget. It skips the empty tail of a large budget
     (deterministic mode sizes it by the context length) but can move the result a
-    few ULP (see ``_fwd_kernel_stage2``), so only deterministic mode turns it on."""
+    few ULP (see ``_fwd_kernel_stage2``), so only deterministic mode turns it on.
+    With ``lse_out`` ([batch, num_q_heads] fp32), the natural-log LSE of each
+    query head is also written to it."""
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
     assert q.shape[0] <= attn_logits.shape[0]
@@ -1302,6 +1324,7 @@ def decode_attention_fwd(
     # ROCm/AMD only: Lean is validated on MI300X/MI355X; CUDA/NVIDIA uses the standard kernel.
     if (
         _is_hip
+        and lse_out is None
         and _lean_head_dim_ok(k_buffer.shape[-1], v_buffer.shape[-1])
         and _should_use_lean_decode(
             enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
@@ -1356,6 +1379,7 @@ def decode_attention_fwd(
             aux_tensors=aux_tensors,
             uneven_batch=uneven_batch,
             stop_at_request_splits=stop_at_request_splits,
+            lse_out=lse_out,
         )
     else:
         # GQA/MQA/MLA
@@ -1382,6 +1406,7 @@ def decode_attention_fwd(
             aux_tensors=aux_tensors,
             uneven_batch=uneven_batch,
             stop_at_request_splits=stop_at_request_splits,
+            lse_out=lse_out,
         )
 
 
