@@ -630,7 +630,8 @@ void run(
       int(window_left),
       float(left_pad)};
   host::LaunchKernel(dim3(tokens, 2 + kRelWorkers), kThreads, q.device())
-      .enable_pdl(SGL_ARCH_HOPPER_OR_GREATER)(prologue_kernel<HEADS, KV_HEADS, PADDED_GROUP, REL_EXTENT, W, DYNAMIC, TAU, DECODE, TW, TS>, p);
+      .enable_pdl(SGL_ARCH_HOPPER_OR_GREATER)(
+          prologue_kernel<HEADS, KV_HEADS, PADDED_GROUP, REL_EXTENT, W, DYNAMIC, TAU, DECODE, TW, TS>, p);
 }
 
 }  // namespace sglang::inkling2_prologue

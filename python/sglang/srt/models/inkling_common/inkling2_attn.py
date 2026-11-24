@@ -460,9 +460,7 @@ class Inkling2Attention(nn.Module):
 
     def _forward(self, hidden_states, positions, forward_batch, *, attn, attn_padded):
         backend = serving_attention_backend(forward_batch)
-        assert backend in ("fa4", "triton"), (
-            "Inkling2 requires FA4 or Triton attention"
-        )
+        assert backend in ("fa4", "triton"), "Inkling2 requires FA4 or Triton attention"
         # Triton (SM8x, which FA4 does not build for) takes the unfused prologue and
         # applies the relative bias as a score_mod.
         fa4 = backend == "fa4"

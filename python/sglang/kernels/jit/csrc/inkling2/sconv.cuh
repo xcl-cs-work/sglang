@@ -373,7 +373,8 @@ void run(
       !DYNAMIC && sw0 == W && sw1 == 1 && weight % 16 == 0};
   int const groups = int(d / kVec);
   host::LaunchKernel(dim3(rows, (groups + kThreads - 1) / kThreads), kThreads, x.device())
-      .enable_pdl(SGL_ARCH_HOPPER_OR_GREATER)(sconv_kernel<W, TOP_K, DYNAMIC, DECODE, WINDOW, RESIDUAL, EPILOGUE, TX, TW, TC, TA, TO>, p);
+      .enable_pdl(SGL_ARCH_HOPPER_OR_GREATER)(
+          sconv_kernel<W, TOP_K, DYNAMIC, DECODE, WINDOW, RESIDUAL, EPILOGUE, TX, TW, TC, TA, TO>, p);
 }
 
 }  // namespace sglang::inkling2_sconv
