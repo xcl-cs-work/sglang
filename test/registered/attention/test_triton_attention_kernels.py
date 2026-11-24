@@ -878,8 +878,10 @@ class TestTritonAttention(CustomTestCase):
                     rows = slice(int(kv_indptr[b]), int(kv_indptr[b + 1]))
                     keys = k[rows].float().repeat_interleave(H_Q // H_KV, dim=1)
                     scores = torch.einsum("hd,lhd->hl", q[b].float(), keys) * D**-0.5
+                    # The MHA kernel rounds each q * k product to BF16 (about 4e-3 of
+                    # LSE at D=128); a dropped split or a log2 LSE is off by > 0.1.
                     torch.testing.assert_close(
-                        lse[b], torch.logsumexp(scores, -1), atol=2e-3, rtol=0
+                        lse[b], torch.logsumexp(scores, -1), atol=1e-2, rtol=0
                     )
 
     def test_decode_attention_gqa_group_above_tile(self):
