@@ -295,8 +295,9 @@ class Inkling2Attention(nn.Module):
         self.verify_max_splits = (
             -(-config.sliding_window_size // 128) + 1 if is_local else 128
         )
-        # SM120 has no NVLink multicast.
-        self.group_all_reduce = get_platform().is_sm120
+        # SM8x and SM120 have no NVLink multicast.
+        platform = get_platform()
+        self.group_all_reduce = platform.is_sm120 or platform.device_sm // 10 == 8
 
     def _pad_heads(self, x):
         return pad_head_groups(
