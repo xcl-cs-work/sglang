@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
 
@@ -180,6 +181,28 @@ def _stacked(rows: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, int]:
     return torch.stack(rows), base.numel()
 
 
+def _message_controllers_sm7x(dests, messages, down, gain, forget, eps):
+    """message_controllers with its GEMMs on FP16 tensor cores (Triton has no SM7x
+    MMA); the BF16 operands the kernels round to convert to FP16 exactly."""
+    dest, message = torch.stack(dests), torch.stack(messages)
+
+    def rms(x):
+        return (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)).to(
+            torch.bfloat16
+        )
+
+    normed = torch.cat([rms(dest), rms(message)], dim=-1).half()
+    hidden = torch.bmm(normed, down.half().transpose(1, 2), out_dtype=torch.float32)
+    hidden = hidden.to(torch.bfloat16).half()
+    gain_logits = torch.bmm(
+        hidden, gain.half().transpose(1, 2), out_dtype=torch.float32
+    )
+    forget_logits = torch.bmm(
+        hidden, forget.half().transpose(1, 2), out_dtype=torch.float32
+    )
+    return (1.0 - torch.tanh(forget_logits)) * dest + torch.tanh(gain_logits) * message
+
+
 def message_controllers(dests, messages, down, gain, forget, eps=1e-6):
     """Mix messages[i] into dests[i] with controller i of the stacked weights into
     row i of the (len(dests), tokens, width) output:
@@ -190,10 +213,12 @@ def message_controllers(dests, messages, down, gain, forget, eps=1e-6):
     assert gain.shape == forget.shape == (num, k // 2, rank)
     assert down.dtype == gain.dtype == forget.dtype == torch.bfloat16
     assert down.is_contiguous() and gain.is_contiguous() and forget.is_contiguous()
-    dest, dest_stride = _stacked(tuple(dests))
-    message, message_stride = _stacked(tuple(messages))
     tokens, width = dests[0].shape
     assert width * 2 == k and messages[0].shape == dests[0].shape
+    if tokens and not current_arch().is_sm_at_least(8, 0):
+        return _message_controllers_sm7x(dests, messages, down, gain, forget, eps)
+    dest, dest_stride = _stacked(tuple(dests))
+    message, message_stride = _stacked(tuple(messages))
     out = torch.empty((num, tokens, width), dtype=torch.float32, device=dest.device)
     if not tokens:
         return out

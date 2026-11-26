@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
@@ -835,6 +836,26 @@ def _can_accumulate_into_addend(
     )
 
 
+def sm7x_bf16_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+) -> Optional[torch.Tensor]:
+    """A BF16 linear on SM7x FP16 tensor cores (FP32 output), or None elsewhere.
+    SM7x has no BF16 tensor cores (cuBLAS runs BF16 about 10x slower there); BF16
+    converts to FP16 exactly within its range, which normed activations stay in."""
+    if not (
+        x.is_cuda
+        and x.dtype == weight.dtype == torch.bfloat16
+        and not current_arch().is_sm_at_least(8, 0)
+        and not torch.compiler.is_compiling()
+    ):
+        return None
+    flat = x.reshape(-1, x.shape[-1]).half()
+    out = torch.mm(flat, weight.half().T, out_dtype=torch.float32)
+    if bias is not None:
+        out += bias.float()
+    return out.to(x.dtype).view(*x.shape[:-1], weight.shape[0])
+
+
 def _sm12x_bf16_gemv_eligible(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
 ) -> bool:
@@ -1177,6 +1198,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         # SM12x auto path; hopper_bf16_gemv is the opt-in gemv backend's 1-row kernel.
         if _sm12x_bf16_gemv_eligible(x, layer.weight, bias):
             return _sm12x_bf16_gemv(x, layer.weight, bias)
+        sm7x_output = sm7x_bf16_linear(x, layer.weight, bias)
+        if sm7x_output is not None:
+            return sm7x_output
         if bias is not None:
             # RowParallelLinear holds its bias on TP rank 0 only, and FlashInfer
             # syncs each tuning call across TP ranks.

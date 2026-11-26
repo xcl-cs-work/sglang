@@ -7,6 +7,7 @@ import cutlass
 import torch
 from cutlass import Float32, Int32, const_expr, cute, range_constexpr
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.flash_attn.cute.utils import predicate_k
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     BASE_ALIGN,
@@ -242,6 +243,24 @@ def compile_qk_l2_clip_fwd(
     )
 
 
+def _qk_l2_clip_reference(x, threshold, eps, scale, output_scale, output_dtype):
+    values = x.float()
+    if scale is not None:
+        if scale.ndim == 2:
+            # One scale row per head: row r uses scale[r % heads].
+            scale = scale.repeat(x.shape[0] // scale.shape[0], 1)
+        values = values * scale.float()
+    norm = values.square().sum(-1, keepdim=True).sqrt()
+    values = values * torch.clamp(threshold / (norm + eps), max=1.0)
+    if output_scale is not None:
+        rows_per_scale = x.shape[0] // output_scale.numel()
+        values = (
+            values.to(output_dtype).float()
+            * output_scale.repeat_interleave(rows_per_scale)[:, None]
+        )
+    return values.to(output_dtype)
+
+
 def qk_l2_clip_fwd_cutedsl(
     x: torch.Tensor,
     threshold: float,
@@ -285,6 +304,11 @@ def qk_l2_clip_fwd_cutedsl(
     y = torch.empty((M, N), device="cuda", dtype=output_dtype)
     if x.numel() == 0:
         return y
+    if not current_arch().is_sm_at_least(8, 0):
+        # CuTe DSL has no SM7x target.
+        return _qk_l2_clip_reference(
+            x.reshape(M, N), threshold, eps, scale, output_scale, output_dtype
+        )
 
     compiled = compile_qk_l2_clip_fwd(
         torch_to_cute_dtype[x.dtype],

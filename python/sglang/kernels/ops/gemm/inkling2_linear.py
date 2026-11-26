@@ -300,10 +300,24 @@ def linear(
         return out.view(*x.shape[:-1], weight.shape[0])
     if out_dtype == torch.float32 and x.is_cuda and x.dtype != torch.float32:
         flat = x.reshape(-1, x.shape[-1])
+        if not current_arch().is_sm_at_least(8, 0):
+            # cuBLAS mixed-precision GEMMs into FP32 need SM80+; the upcast is exact.
+            out = F.linear(
+                flat.float(),
+                weight.float(),
+                bias.float() if bias is not None else None,
+            )
+            return out.view(*x.shape[:-1], weight.shape[0])
         out = (
             torch.mm(flat, weight.T, out_dtype=torch.float32)
             if bias is None
             else torch.addmm(bias, flat, weight.T, out_dtype=torch.float32)
         )
         return out.view(*x.shape[:-1], weight.shape[0])
+    if not current_arch().is_sm_at_least(8, 0):
+        from sglang.srt.layers.quantization.unquant import sm7x_bf16_linear
+
+        sm7x_output = sm7x_bf16_linear(x, weight, bias)
+        if sm7x_output is not None:
+            return sm7x_output.to(out_dtype)
     return F.linear(x, weight, bias).to(out_dtype)

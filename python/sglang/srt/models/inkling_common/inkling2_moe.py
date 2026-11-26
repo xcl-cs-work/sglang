@@ -54,9 +54,12 @@ from sglang.kernels.ops.moe.inkling_moe import (
     compute_expert_block_metadata,
     compute_grouped_gemm_metadata,
     get_src2dst,
+    grouped_gemm_mxfp8_per_expert,
     grouped_gemm_triton,
+    grouped_gemv_mxfp8,
     post_reorder,
     pre_reorder,
+    select_grouped_gemm_block_m,
 )
 from sglang.kernels.ops.quantization.inkling2_mxfp8_scales_sm120 import (
     mxfp8_weight_scales,
@@ -79,7 +82,7 @@ BF16_COMBINE_MIN_TOKENS = 512
 def _capped_swiglu(gate_up, gammas, gate_cap, up_cap, offsets=None):
     """swiglu of interleaved (gate, up) columns, each capped as cap * tanh(x / cap),
     with the sigmoid of the uncapped gate; rows outside [offsets[0], offsets[-1])
-    are zero. Only BF16 experts take this path."""
+    are zero. Only BF16 experts and the decoded MXFP8 experts below SM80 use it."""
     gate, up = gate_up.float().unflatten(-1, (-1, 2)).unbind(-1)
     sigmoid = torch.sigmoid(gate)
     if gate_cap > 0:
@@ -298,6 +301,11 @@ class Inkling2Experts(nn.Module):
             or platform.is_sm90
             or (platform.is_sm120 and not self.native_sm120)
         )
+        # Below SM80 (no Marlin, no block-scaled MMA) the grouped GEMM decodes the
+        # E4M3 expert weights itself.
+        self.decode_mxfp8 = (
+            platform.device_sm < 80 and self._routed_kernels == torch.float8_e4m3fn
+        )
 
     def _empty_weight(self, shape, dtype):
         if (
@@ -341,7 +349,7 @@ class Inkling2Experts(nn.Module):
         return self.mega is not None and (low > high or self.mega.min_tokens <= low)
 
     def prepare_routed_exchange(self):
-        if self.ep_size == 1 or self.use_marlin:
+        if self.ep_size == 1 or self.use_marlin or self.decode_mxfp8:
             return
         group, hidden = get_parallel().moe_ep_group, self.w2_weight.shape[1]
         routed_tokens = self.max_routed_ids // self.top_k
@@ -618,6 +626,8 @@ class Inkling2Experts(nn.Module):
             return self._forward_sm120(x, weights, ids, combine)
         if self._marlin:
             return self._forward_source(x, weights, ids, combine)
+        if self.decode_mxfp8:
+            return self._forward_decoded(x, weights, ids, combine)
         if self._lacks_routed_kernels:
             raise ValueError(
                 "Inkling2 quantized experts run only on the routed kernels, which need "
@@ -837,6 +847,41 @@ class Inkling2Experts(nn.Module):
         if not combine:
             return RoutedOutput(combined, self._identity[:tokens], 1)
         return combined.to(x.dtype)
+
+    def _forward_decoded(self, x, weights, ids, combine):
+        """MXFP8 experts below SM80: grouped GEMMs over this rank's routed rows that
+        decode the E4M3 weights, then one EP all-reduce per token."""
+        top_k = ids.shape[1]
+        num_local = self.w13_weight.shape[0]
+        start = self.ep_rank * num_local
+        sorted_ids, permutation = torch.sort(ids.to(torch.int16).flatten(), stable=True)
+        src2dst = get_src2dst(permutation)
+        block_size_m = select_grouped_gemm_block_m(ids.numel())
+        counts, offsets, block_offsets, schedule = compute_grouped_gemm_metadata(
+            sorted_ids, self.num_global_experts, block_size_m=block_size_m
+        )
+        if self.ep_size > 1:
+            counts = counts[start : start + num_local]
+            offsets = offsets[start : start + num_local + 1]
+            block_offsets, schedule = compute_expert_block_metadata(
+                counts, ids.numel(), block_size_m=block_size_m
+            )
+        metadata = (counts, offsets, block_offsets, schedule)
+        inputs = pre_reorder(x.contiguous(), src2dst, top_k)
+        gate_up = _decoded_matmul(
+            inputs, self.w13_weight, self.w13_scale, metadata, block_size_m
+        )
+        gammas = pre_reorder(weights.reshape(-1, 1), src2dst, 1).flatten()
+        activated = _capped_swiglu(gate_up, gammas, self.gate_cap, self.up_cap, offsets)
+        down = _decoded_matmul(
+            activated, self.w2_weight, self.w2_scale, metadata, block_size_m
+        )
+        rows = torch.arange(down.shape[0], device=down.device)
+        down.masked_fill_(((rows < offsets[0]) | (rows >= offsets[-1]))[:, None], 0)
+        out = post_reorder(down, src2dst, torch.ones_like(weights))
+        if self.ep_size > 1:
+            out = get_parallel().moe_ep_group.all_reduce(out)
+        return out if combine else RoutedOutput(out, None, 0)
 
     def _mxfp8_routed(self, x, dst2src, top_k, gammas, metadata, tokens):
         gate_up = mxfp8_routed_matmul(
@@ -1060,7 +1105,23 @@ class Inkling2Experts(nn.Module):
         return unweighted_post_reorder(down, src2dst, top_k)
 
 
+def _decoded_matmul(x, weight, scale, metadata, block_size_m):
+    counts, offsets, block_offsets, schedule = metadata
+    # Per-expert cuBLAS syncs on the offsets, so CUDA graphs take the GEMV.
+    if (
+        x.shape[0] >= DECODED_PER_EXPERT_MIN_ROWS
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        return grouped_gemm_mxfp8_per_expert(x, weight, scale, offsets)
+    return grouped_gemv_mxfp8(
+        x, weight, scale, counts, offsets, block_offsets, schedule, block_size_m
+    )
+
+
 PREFILL_EXCHANGE_MAX_TOKENS = 32768
+# Routed rows from which per-expert cuBLAS beats the CUDA-core GEMV for decoded
+# MXFP8 experts; measured on a Quadro RTX 6000 (SM75) at EP2.
+DECODED_PER_EXPERT_MIN_ROWS = 1024
 # Above 256 rows the router and RMSNorm pick the same kernel at any row count.
 MEGA_MOE_LOCAL_INPUT_MIN_ROWS = 257
 PARTIAL_COMBINE_MIN_TOKENS = 16
