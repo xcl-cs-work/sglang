@@ -123,6 +123,14 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
 
 def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
     if torch.cuda.get_device_capability()[0] < 8:
+        if get_model().dtype == "bfloat16":
+            # An explicit --dtype bfloat16 is kept; torch and Triton emulate BF16
+            # math below SM80, slower than FP16 tensor cores.
+            logger.info(
+                "Compute capability below sm80. Keeping the requested bfloat16, "
+                "which runs without tensor cores."
+            )
+            return
         logger.info(
             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
         )

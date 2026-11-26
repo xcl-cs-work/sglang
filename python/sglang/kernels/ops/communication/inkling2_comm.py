@@ -74,6 +74,9 @@ def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tens
         raise ValueError("Inkling2 collectives require BF16 or FP32 CUDA tensors")
     if x.nbytes % 4:
         raise ValueError("Inkling2 collective payloads must be 4-byte aligned")
+    if torch.cuda.get_device_capability(x.device)[0] < 9:
+        # multimem (NVLink multicast) needs SM90+; the clone keeps x unmodified.
+        return group.all_reduce(x.clone())
     x = x.contiguous()
     if (
         not multicast

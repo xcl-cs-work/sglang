@@ -1015,3 +1015,149 @@ def grouped_gemm_triton(
         )
 
     return c
+
+
+# SM7x MXFP8 experts. Triton emits no tensor-core MMA below SM80, so the decode-sized
+# GEMV streams each weight tile once and multiplies it into every routed row on
+# CUDA cores, and larger batches dequantize one expert at a time for cuBLAS FP16.
+@triton.jit
+def _decode_mxfp8_tile(bits, scale_bits, dtype: tl.constexpr):
+    """E4M3 bits and their UE8M0 scales (same shape) -> dtype values, without the
+    SM89+ E4M3 conversion instructions."""
+    # Shifting E4M3 into FP16 (bias 15 vs 7) is exact for normals and
+    # subnormals alike and leaves a factor of 2^-8, folded into the scale.
+    sign = (bits & 0x80).to(tl.int16) << 8
+    magnitude = (bits & 0x7F).to(tl.int16) << 7
+    values = (sign | magnitude).to(tl.float16, bitcast=True).to(tl.float32)
+    return (values * tl.exp2(scale_bits.to(tl.float32) - 119.0)).to(dtype)
+
+
+@triton.jit
+def _grouped_gemv_mxfp8_kernel(
+    A,
+    B,
+    BScale,
+    C,
+    NumTokensPerExpert,
+    ExpertTokenOffs,
+    ExpertBlockOffs,
+    ExpertBlockSchedule,
+    E: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    if pid_m >= tl.load(ExpertBlockOffs + E):
+        return
+    expert_id, block_start, block_end = _compute_expert_attrs(
+        pid_m,
+        NumTokensPerExpert,
+        ExpertTokenOffs,
+        ExpertBlockSchedule,
+        BLOCK_SIZE_M,
+        True,
+    )
+    cols = tl.program_id(1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    w_rows = B + expert_id * N * K + cols[:, None].to(tl.int64) * K
+    s_rows = BScale + expert_id * N * (K // 32) + cols[:, None].to(tl.int64) * (K // 32)
+    for row in range(block_start, block_end):
+        acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+        for k0 in range(0, K, BLOCK_SIZE_K):
+            k = k0 + offs_k
+            w = _decode_mxfp8_tile(
+                tl.load(w_rows + k[None, :]),
+                tl.load(s_rows + k[None, :] // 32),
+                tl.float32,
+            )
+            x = tl.load(A + row * K + k).to(tl.float32)
+            acc += tl.sum(w * x[None, :], axis=1)
+        tl.store(C + row * N + cols, acc.to(C.dtype.element_ty))
+
+
+def grouped_gemv_mxfp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    expert_token_offs: torch.Tensor,
+    expert_block_offs: torch.Tensor,
+    expert_block_schedule: torch.Tensor,
+    block_size_m: int,
+) -> torch.Tensor:
+    """grouped_gemm_triton with an MXFP8 b for few rows per expert, on CUDA cores;
+    rows outside the schedule are left unwritten."""
+    M, K = a.shape
+    E, N, _ = b.shape
+    assert a.is_contiguous() and b.is_contiguous() and b_scale.is_contiguous()
+    assert b.dtype == torch.float8_e4m3fn and b_scale.shape == (E, N, K // 32)
+    block_n, block_k = 64, 128
+    assert N % block_n == 0 and K % block_k == 0, f"{N=} {K=}"
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    _grouped_gemv_mxfp8_kernel[(expert_block_schedule.numel(), N // block_n)](
+        a,
+        b.view(torch.uint8),
+        b_scale.view(torch.uint8),
+        c,
+        num_tokens_per_expert,
+        expert_token_offs,
+        expert_block_offs,
+        expert_block_schedule,
+        E=E,
+        N=N,
+        K=K,
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=block_k,
+        num_warps=4,
+    )
+    return c
+
+
+@triton.jit
+def _dequant_mxfp8_kernel(B, BScale, Out, K: tl.constexpr, BLOCK_K: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    w = _decode_mxfp8_tile(
+        tl.load(B + row * K + k)[None, :],
+        tl.load(BScale + row * (K // 32) + k // 32)[None, :],
+        tl.float16,
+    )
+    tl.store(Out + row * K + k[None, :], w)
+
+
+def dequant_mxfp8_fp16(b: torch.Tensor, b_scale: torch.Tensor, out: torch.Tensor):
+    """One expert's MXFP8 [N, K] weight into FP16 out [N, K]."""
+    N, K = b.shape
+    block_k = 128
+    assert K % block_k == 0 and out.shape == (N, K) and out.dtype == torch.float16
+    _dequant_mxfp8_kernel[(N, K // block_k)](
+        b.view(torch.uint8), b_scale.view(torch.uint8), out, K, block_k, num_warps=4
+    )
+    return out
+
+
+def grouped_gemm_mxfp8_per_expert(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    expert_token_offs: torch.Tensor,
+) -> torch.Tensor:
+    """grouped_gemm_triton with an MXFP8 b as one cuBLAS FP16 GEMM per expert (FP32
+    output): FP16 tensor cores on SM7x. Syncs on the offsets; not CUDA-graph safe.
+    The BF16 inputs (normed hidden states and capped SwiGLU outputs) fit FP16."""
+    M, K = a.shape
+    E, N, _ = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    a16 = a.to(torch.float16)
+    weight = torch.empty((N, K), device=a.device, dtype=torch.float16)
+    offsets = expert_token_offs.tolist()
+    for expert in range(E):
+        start, end = offsets[expert], offsets[expert + 1]
+        if end > start:
+            dequant_mxfp8_fp16(b[expert], b_scale[expert], weight)
+            c[start:end] = torch.mm(a16[start:end], weight.T, out_dtype=torch.float32)
+    return c

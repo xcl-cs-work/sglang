@@ -122,7 +122,8 @@ class Inkling2QuantConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 80
+        # SM7x (no Marlin) serves MXFP8 experts by decoding the E4M3 weights itself.
+        return 75
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:

@@ -25,6 +25,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.attention import extend_attention_sm7x
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.dflash_block_splitkv import dflash_block_splitkv
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
@@ -992,6 +993,39 @@ def extend_attention_fwd(
     prefix dots in BF16 instead of casting q and the probabilities to FP8 (no FP8
     prefix or zero-prefix kernel). No effect on a BF16 cache.
     """
+    if (
+        q_extend.dtype == torch.bfloat16
+        and not current_arch().is_sm_at_least(8, 0)
+        and not (skip_prefix or skip_extend or identity_kv_indices)
+        and extend_attention_sm7x.supports(
+            custom_mask=custom_mask,
+            is_causal=is_causal,
+            logit_cap=logit_cap,
+            sinks=sinks,
+            xai_temperature_len=xai_temperature_len,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            score_mod=score_mod,
+            q_extend=q_extend,
+        )
+    ):
+        # Triton has no SM7x tensor-core MMA; BF16 (only an explicit --dtype there)
+        # runs on FP16 tensor cores instead.
+        return extend_attention_sm7x.extend_attention_sm7x(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            sm_scale or 1.0 / (q_extend.shape[-1] ** 0.5),
+            sliding_window_size=sliding_window_size,
+            aux_tensors=aux_tensors if score_mod is not None else None,
+            lse_extend=lse_extend,
+        )
     Lq, Lk, Lv = (
         q_extend.shape[-1],
         k_extend.shape[-1],

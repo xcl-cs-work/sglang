@@ -7,6 +7,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, const_expr
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.flash_attn.cute.utils import predicate_k
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
@@ -279,6 +280,14 @@ def _compile_norm(
     )
 
 
+def _rms_norm_reference(x, weight, eps, pre_weight):
+    values = x.float()
+    if pre_weight is not None:
+        values = values * pre_weight.float()
+    values = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
+    return values * weight.float() if weight is not None else values
+
+
 def rms_norm(x, weight, eps, *, pre_weight=None, output_dtype=None, out=None):
     assert x.is_cuda and x.shape[-1] > 0 and x.shape[-1] % 4 == 0
     shape = x.shape
@@ -302,6 +311,12 @@ def rms_norm(x, weight, eps, *, pre_weight=None, output_dtype=None, out=None):
     if not x.numel():
         return y
     width = x.shape[-1]
+    if not current_arch().is_sm_at_least(8, 0):
+        # CuTe DSL has no SM7x target.
+        y.view(-1, width).copy_(
+            _rms_norm_reference(x, weight, eps, pre_weight).reshape(-1, width)
+        )
+        return y
     preload = (
         weight is not None
         and pre_weight is None

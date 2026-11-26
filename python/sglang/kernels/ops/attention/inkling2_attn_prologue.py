@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.numerics import rsqrt_approx_f32
 
@@ -657,7 +658,9 @@ def _cuda_prologue(
     tokens = q_in.shape[0]
     tensors = (q_in, k_in, v_in, r_in, k_cache, v_cache, k_window, v_window)
     if not (
-        heads * 8 <= 128
+        # The rel projection uses BF16 mma.sync (SM80+).
+        current_arch().is_sm_at_least(8, 0)
+        and heads * 8 <= 128
         and kv_heads in (1, 2)
         and heads <= kv_heads * padded_group <= 16
         and heads % kv_heads == 0

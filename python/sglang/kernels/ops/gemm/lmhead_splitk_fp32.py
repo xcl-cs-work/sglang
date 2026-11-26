@@ -150,3 +150,12 @@ def lmhead_fp32(
     y = torch.empty((m, n), device=x.device, dtype=out_dtype)
     _lmhead_sum[(triton.cdiv(m * n, 1024),)](p, y, m * n, sk, 1024, num_warps=4)
     return y
+
+
+def fp32_out_gemm(
+    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x @ w.T`` with FP32 output for SM7x, where cuBLAS has no BF16 -> FP32 GEMM
+    and Triton no tensor-core MMA: a cuBLAS FP16 GEMM. The BF16 operands (a normed
+    hidden state and the head weight) convert to FP16 exactly within its range."""
+    return torch.mm(x.half(), w.half().T, out_dtype=torch.float32, out=out)

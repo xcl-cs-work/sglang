@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.activation.softcap import (
     cast_to_float32_logits,
     gathered_softcap_logits,
@@ -1472,6 +1473,13 @@ class LogitsProcessor(nn.Module):
                     )
 
                     logits = lmhead_fp32(hidden_states, lm_head.weight)
+                elif not current_arch().is_sm_at_least(8, 0):
+                    # cuBLAS BF16 -> FP32 GEMMs need SM80+.
+                    from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import (
+                        fp32_out_gemm,
+                    )
+
+                    logits = fp32_out_gemm(hidden_states, lm_head.weight, out=out)
                 else:
                     logits = torch.mm(
                         hidden_states,
