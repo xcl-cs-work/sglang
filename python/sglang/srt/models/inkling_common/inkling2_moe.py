@@ -243,8 +243,10 @@ class Inkling2Experts(nn.Module):
                     )
         self.gate_cap, self.up_cap = config.mlp_gate_softcap, config.mlp_up_softcap
         platform = get_platform()
-        # SM120 has no NVLink multicast.
-        self.multicast_combine = not platform.is_sm120
+        # SM8x and SM120 have no NVLink multicast.
+        self.multicast_combine = not (
+            platform.is_sm120 or platform.device_sm // 10 == 8
+        )
         self.output_sizes = {"w13": 2 * intermediate, "w2": config.hidden_size}
         self._marlin = {}
         self.max_routed_ids = min(

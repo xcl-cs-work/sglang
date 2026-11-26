@@ -224,8 +224,10 @@ class Inkling2LogitsProcessor(LogitsProcessor):
         super().__init__(config)
         self.vocab_size = config.padded_vocab_size
         self.input_logprob_processor.vocab_size = self.vocab_size
-        # SM120 has no NVLink multicast: gather over NCCL, never rendezvous symm mem.
-        if get_platform().is_sm120:
+        # SM8x and SM120 have no NVLink multicast: gather over NCCL,
+        # never rendezvous symm mem.
+        platform = get_platform()
+        if platform.is_sm120 or platform.device_sm // 10 == 8:
             self._logits_gatherer = MultimemAllGatherer(max_tokens=0, enabled=False)
         self.use_fp32_lm_head = output_dtype == torch.float32
         # FP32 logits: softcap each rank's vocab shard before the gather, and
