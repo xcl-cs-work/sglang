@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.moe.inkling2_moe import _mxfp8_block
+from sglang.kernels.ops.moe.inkling2_moe import _mxfp8_block, to_e4m3_values
 
 ROW_LOOP_MIN_ROWS = 1024
 
@@ -104,8 +104,8 @@ def _nvfp4_values(x, amax):
     block_max = tl.max(tl.abs(x), 1)
     scale6 = tl.minimum(block_max * (encoder_scale * (1.0 / 6.0)), 448.0)
     scale4 = tl.minimum(block_max * (encoder_scale * 0.25), 448.0)
-    scale6 = scale6.to(tl.float8e4nv).to(tl.float32)
-    scale4 = scale4.to(tl.float8e4nv).to(tl.float32)
+    scale6 = to_e4m3_values(scale6).to(tl.float32)
+    scale4 = to_e4m3_values(scale4).to(tl.float32)
     inverse6 = tl.minimum(tl.div_rn(1.0, scale6 * decoder_scale), 3.4028234663852886e38)
     inverse4 = tl.minimum(tl.div_rn(1.0, scale4 * decoder_scale), 3.4028234663852886e38)
     rounded6 = _e2m1_round(x * inverse6[:, None])

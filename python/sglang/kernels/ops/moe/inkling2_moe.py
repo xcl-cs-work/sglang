@@ -3,9 +3,14 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 
 PDL = is_arch_support_pdl()
+# griddepcontrol needs SM90+; read inside kernels as a constexpr.
+PDL_ARCH = tl.constexpr(PDL)
+# Triton converts to FP8 E4M3 only on SM89+; older GPUs round in software.
+E4M3_CVT = tl.constexpr(current_arch().is_sm_at_least(8, 9))
 # Below this many rows the Triton _mxfp8_quantize is as fast.
 MXFP8_CUDA_MIN_ROWS = 64
 
@@ -29,6 +34,25 @@ def routed_quant_module(width: int):
 
 
 @triton.jit
+def _round_e4m3(x):
+    """FP32 x (|x| <= 448) rounded to the nearest FP8 E4M3 value (ties to even, E4M3
+    subnormals below 2^-6), as FP32: what x.to(tl.float8e4nv).to(tl.float32) gives."""
+    exponent = ((x.to(tl.int32, bitcast=True) >> 23) & 0xFF) - 127
+    step = ((tl.maximum(exponent, -6) + 124) << 23).to(tl.float32, bitcast=True)
+    return libdevice.rint(x / step) * step
+
+
+@triton.jit
+def to_e4m3_values(x):
+    """FP32 x (|x| <= 448) on the FP8 E4M3 grid, as FP8 where Triton can convert."""
+    if E4M3_CVT:
+        x = x.to(tl.float8e4nv)
+    else:
+        x = _round_e4m3(x)
+    return x
+
+
+@triton.jit
 def _mxfp8_block(groups):
     amax = tl.max(tl.abs(groups), 1)
     raw_scale = amax * (1.0 / 448.0)
@@ -44,13 +68,14 @@ def _mxfp8_block(groups):
     values = tl.minimum(
         tl.maximum(values, -448.0), 448.0, propagate_nan=tl.PropagateNan.ALL
     )
-    return values.to(tl.float8e4nv), exponent
+    return to_e4m3_values(values), exponent
 
 
 @triton.jit
 def _mxfp8_quantize(X, Y, S, N: tl.constexpr, BLOCK: tl.constexpr):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if PDL_ARCH:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     x = tl.load(X + row * N + cols, cols < N, other=0).to(tl.float32)
@@ -168,8 +193,9 @@ def _routed_rows(
     per_rank=1,
     THREADS: tl.constexpr = 128,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if PDL_ARCH:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     if STRIDED:
         chunks: tl.constexpr = (N + BLOCK - 1) // BLOCK
         lo = tl.load(Offsets)
@@ -319,8 +345,9 @@ def _sm_count(device):
 def _unweighted_post_reorder(
     X, Y, Src2Dst, TOP_K: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if PDL_ARCH:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     src = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = cols < H
@@ -347,8 +374,9 @@ def _routed_partial(
     BLOCK: tl.constexpr,
     SEARCH: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if PDL_ARCH:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     src = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     lo = tl.load(Offsets)

@@ -842,6 +842,48 @@ class TestTritonAttention(CustomTestCase):
         for B, H_Q, H_KV, D in configs:
             self._test_decode_attention_once(B, H_Q, H_KV, D)
 
+    def test_decode_attention_lse_out(self):
+        """lse_out holds the natural-log softmax normalizer of each query head,
+        merged across KV splits (gate/sink epilogues such as Inkling2's read it)."""
+        device, dtype = get_device(), torch.bfloat16
+        max_kv_splits, D = 8, 128
+        for H_Q, H_KV in ((8, 8), (24, 8)):  # normal and grouped kernels
+            with self.subTest(H_Q=H_Q, H_KV=H_KV):
+                seq_lens = torch.tensor([1, 37, 300], device=device)
+                B, total = len(seq_lens), int(seq_lens.sum())
+                q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+                k = torch.randn(total, H_KV, D, dtype=dtype, device=device)
+                v = torch.randn(total, H_KV, D, dtype=dtype, device=device)
+                kv_indptr = torch.zeros(B + 1, dtype=torch.int32, device=device)
+                kv_indptr[1:] = torch.cumsum(seq_lens, 0)
+                o = torch.empty_like(q)
+                lse = torch.empty(B, H_Q, dtype=torch.float32, device=device)
+                decode_attention_fwd(
+                    q,
+                    k,
+                    v,
+                    o,
+                    kv_indptr,
+                    torch.arange(total, device=device),
+                    torch.empty(B, H_Q, max_kv_splits, D, device=device),
+                    torch.empty(B, H_Q, max_kv_splits, device=device),
+                    torch.full((B,), 4, dtype=torch.int32, device=device),
+                    max_kv_splits,
+                    D**-0.5,
+                    1.0,
+                    1.0,
+                    lse_out=lse,
+                )
+                for b in range(B):
+                    rows = slice(int(kv_indptr[b]), int(kv_indptr[b + 1]))
+                    keys = k[rows].float().repeat_interleave(H_Q // H_KV, dim=1)
+                    scores = torch.einsum("hd,lhd->hl", q[b].float(), keys) * D**-0.5
+                    # The MHA kernel rounds each q * k product to BF16 (about 4e-3 of
+                    # LSE at D=128); a dropped split or a log2 LSE is off by > 0.1.
+                    torch.testing.assert_close(
+                        lse[b], torch.logsumexp(scores, -1), atol=1e-2, rtol=0
+                    )
+
     def test_decode_attention_gqa_group_above_tile(self):
         """Every query head reads its own KV head when a GQA group is wider than
         the grouped kernel's 16-head tile, also when it is not a multiple of 16."""

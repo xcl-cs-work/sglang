@@ -7,6 +7,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, const_expr
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.flash_attn.cute.utils import predicate_k
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     BASE_ALIGN,
@@ -35,8 +36,10 @@ class RMSNormFwd:
         has_pre_affine: bool = False,
         preload_weight: bool = False,
         x_alignment: int = 16,
+        use_pdl: bool = True,
     ):
         self.x_alignment = x_alignment
+        self.use_pdl = use_pdl
         self.N = N
         self.has_pre_affine = has_pre_affine
         self.preload_weight = preload_weight
@@ -120,7 +123,7 @@ class RMSNormFwd:
             grid=[cute.ceil_div(norm_num_rows(mX), tile_mn[0]), 1, 1],
             block=[cute.size(tiled_copy), 1, 1],
             stream=stream,
-            use_pdl=True,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -137,8 +140,9 @@ class RMSNormFwd:
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bid_m, _, _ = cute.arch.block_idx()
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
         tv_layout = tiled_copy.layout_tv_tiled
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
@@ -242,6 +246,7 @@ def _compile_norm(
         has_pre_affine=pre_weight_dtype is not None,
         preload_weight=preload,
         x_alignment=x_layout[1],
+        use_pdl=is_arch_support_pdl(),
     )
     tokens = cute.sym_int64()
     x = make_fake_norm_rows(x_dtype, width, *x_layout)

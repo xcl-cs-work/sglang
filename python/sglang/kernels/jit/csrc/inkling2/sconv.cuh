@@ -143,8 +143,8 @@ __global__ void __launch_bounds__(kThreads) sconv_kernel(Params p) {
   // before waiting on the previous kernel, which writes none of them.
   constexpr bool kEarly = DECODE || WINDOW;
   if constexpr (!kEarly) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;");
+    device::PDLWaitPrimary<true>();
+    device::PDLTriggerSecondary<true>();
   }
   int const row = blockIdx.x;
   int const col = (blockIdx.y * kThreads + threadIdx.x) * kVec;
@@ -189,8 +189,8 @@ __global__ void __launch_bounds__(kThreads) sconv_kernel(Params p) {
   }
 
   if constexpr (kEarly) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;");
+    device::PDLWaitPrimary<true>();
+    device::PDLTriggerSecondary<true>();
   }
   constexpr bool kGather = TOP_K > 0;
   constexpr int kRowLoads = DECODE ? 1 : W;
@@ -373,7 +373,8 @@ void run(
       !DYNAMIC && sw0 == W && sw1 == 1 && weight % 16 == 0};
   int const groups = int(d / kVec);
   host::LaunchKernel(dim3(rows, (groups + kThreads - 1) / kThreads), kThreads, x.device())
-      .enable_pdl(true)(sconv_kernel<W, TOP_K, DYNAMIC, DECODE, WINDOW, RESIDUAL, EPILOGUE, TX, TW, TC, TA, TO>, p);
+      .enable_pdl(SGL_ARCH_HOPPER_OR_GREATER)(
+          sconv_kernel<W, TOP_K, DYNAMIC, DECODE, WINDOW, RESIDUAL, EPILOGUE, TX, TW, TC, TA, TO>, p);
 }
 
 }  // namespace sglang::inkling2_sconv

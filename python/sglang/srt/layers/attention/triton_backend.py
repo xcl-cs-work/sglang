@@ -1819,6 +1819,7 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        return_lse=False,
     ):
         if (
             k is not None
@@ -1826,6 +1827,7 @@ class TritonAttnBackend(AttentionBackend):
             and sinks is None
             and score_mod is None
             and aux_tensors is None
+            and not return_lse
             and self._can_run_dense_fp8_chunked_mha(q, k, v, layer, forward_batch)
         ):
             return self._forward_dense_fp8_chunked_mha(q, k, v, layer, forward_batch)
@@ -1939,6 +1941,19 @@ class TritonAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
 
+        # Only the 2-stage extend kernel writes an LSE.
+        if return_lse and (
+            self.enable_deterministic or self.dllm_attention is not None
+        ):
+            raise NotImplementedError(
+                "Triton extend returns an LSE only from the 2-stage kernel"
+            )
+        lse = (
+            q.new_empty((q.shape[0], layer.tp_q_head_num), dtype=torch.float32)
+            if return_lse
+            else None
+        )
+
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
             return self._forward_extend_unified(
@@ -2027,6 +2042,7 @@ class TritonAttnBackend(AttentionBackend):
         if (
             verify_fwd is not None
             and score_mod is None
+            and lse is None
             and forward_batch.forward_mode.is_target_verify()
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2085,8 +2101,9 @@ class TritonAttnBackend(AttentionBackend):
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             bf16_dot=self.draft_bf16_dot,
+            **({"lse_extend": lse} if lse is not None else {}),
         )
-        return o
+        return (o, lse) if return_lse else o
 
     def _forward_extend_kernel(self, layer, *args, **kwargs):
         if self.dllm_attention is not None:
@@ -2475,6 +2492,7 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        return_lse=False,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -2591,10 +2609,15 @@ class TritonAttnBackend(AttentionBackend):
                         is_mla,
                     )
 
+        lse = (
+            q.new_empty((q.shape[0], layer.tp_q_head_num), dtype=torch.float32)
+            if return_lse
+            else None
+        )
         if self.dcp_size > 1:
-            if score_mod is not None:
+            if score_mod is not None or return_lse:
                 raise NotImplementedError(
-                    "DCP Triton decode does not support score_mod"
+                    "DCP Triton decode does not support score_mod or return_lse"
                 )
             group = get_parallel().dcp_group
             with use_symmetric_memory(group):
@@ -2671,8 +2694,9 @@ class TritonAttnBackend(AttentionBackend):
             lean_locks=self.forward_metadata.lean_locks,
             uneven_batch=self.forward_metadata.uneven_batch,
             stop_at_request_splits=self.enable_deterministic,
+            lse_out=lse,
         )
-        return o
+        return (o, lse) if return_lse else o
 
 
 class TritonMultiStepDraftBackend:

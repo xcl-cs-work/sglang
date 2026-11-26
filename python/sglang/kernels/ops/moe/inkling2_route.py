@@ -7,6 +7,8 @@ from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe.gate_topk import fpval_to_key, key_to_indx
 
 PDL = is_arch_support_pdl()
+# griddepcontrol needs SM90+; read inside kernels as a constexpr.
+PDL_ARCH = tl.constexpr(PDL)
 
 ROUTE_MAX_ROWS = 512
 ROUTE_MAX_IDS = 4096
@@ -33,8 +35,9 @@ def _route_topk(
     BLOCK_N: tl.constexpr,
     RENORM: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if PDL_ARCH:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
     mask = cols < N
@@ -150,8 +153,9 @@ def _route_metadata(
     SEARCH_N: tl.constexpr,
     SEARCH_E: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if PDL_ARCH:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offs = tl.arange(0, BLOCK_N)
     mask = offs < n
     ids = tl.load(Ids + offs, mask, other=65535)

@@ -86,6 +86,38 @@ def _assert_relative_error(actual, expected, tolerance):
     assert error < tolerance, f"relative error {error.item():.3g} >= {tolerance}"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_software_e4m3_rounding_matches_fp8_conversion():
+    """The SM8x MXFP8 / NVFP4 fake quantization rounds onto the E4M3 grid in
+    software; it must agree bit for bit with the FP8 conversion, ties and
+    subnormals included."""
+    import triton
+    import triton.language as tl
+
+    from sglang.kernels.ops.moe.inkling2_moe import _round_e4m3
+
+    @triton.jit
+    def _round(X, Y, N, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(Y + i, _round_e4m3(tl.load(X + i, i < N)), i < N)
+
+    codes = torch.arange(256, dtype=torch.uint8, device="cuda")
+    grid = codes.view(torch.float8_e4m3fn).float()
+    grid = grid[grid.isfinite()].unique()
+    g = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.cat(
+        [
+            grid,
+            (grid[1:] + grid[:-1]) / 2,  # ties
+            (torch.rand(1 << 20, device="cuda", generator=g) * 2 - 1) * 448,
+            torch.randn(1 << 20, device="cuda", generator=g) * 2**-7,
+        ]
+    )
+    y = torch.empty_like(x)
+    _round[(triton.cdiv(x.numel(), 1024),)](x, y, x.numel(), 1024)
+    assert torch.equal(y, x.to(torch.float8_e4m3fn).float())
+
+
 @sm100_or_sm103
 @pytest.mark.parametrize(
     "tokens,skewed",
